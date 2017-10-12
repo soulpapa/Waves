@@ -93,6 +93,7 @@ object BlockStats {
   def received(m: MicroBlock, ctx: ChannelHandlerContext): Unit = write(
     micro(m)
       .tag("parent-id", id(m.prevResBlockSig))
+      .tag("discarded-by-cache", "true")
       .addField("from", nodeName(ctx)),
     Event.Received,
     Seq.empty

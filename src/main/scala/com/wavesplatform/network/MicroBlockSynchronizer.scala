@@ -97,9 +97,9 @@ class MicroBlockSynchronizer(settings: MicroblockSynchronizerSettings,
                 mi
               })
               knownMicroBlockOwners.get(totalResBlockSig, () => MSet.empty) += ctx
+              microBlockReceiveTime.put(totalResBlockSig, System.currentTimeMillis())
 
               if (lastBlockId == prevResBlockSig) {
-                microBlockReceiveTime.put(totalResBlockSig, System.currentTimeMillis())
                 microBlockInvStats.increment()
 
                 if (alreadyRequested(totalResBlockSig)) Task.unit
