@@ -1,36 +1,39 @@
 package com.wavesplatform.network
 
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
+import com.google.common.cache.{Cache, CacheBuilder}
 import com.wavesplatform.features.FeatureProvider
 import com.wavesplatform.metrics.{BlockStats, HistogramExt}
 import com.wavesplatform.mining.Miner
-import com.wavesplatform.network.MicroBlockSynchronizer.MicroblockData
 import com.wavesplatform.settings.WavesSettings
+import com.wavesplatform.state2.{ByteStr, trim}
 import com.wavesplatform.state2.reader.StateReader
 import com.wavesplatform.{Coordinator, UtxPool}
 import io.netty.channel.ChannelHandler.Sharable
 import io.netty.channel.group.ChannelGroup
 import io.netty.channel.{Channel, ChannelHandlerContext, ChannelInboundHandlerAdapter}
 import kamon.Kamon
-import scorex.block.Block
+import monix.eval.Task
+import scorex.block.{Block, MicroBlock}
 import scorex.transaction.ValidationError.InvalidSignature
 import scorex.transaction._
 import scorex.utils.{ScorexLogging, Time}
 
+import scala.collection.mutable.{Set => MSet}
+import scala.concurrent.duration.FiniteDuration
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success}
 
 @Sharable
 class CoordinatorHandler(checkpointService: CheckpointService,
-                         history: History,
+                         history: NgHistory,
                          blockchainUpdater: BlockchainUpdater,
                          time: Time,
                          stateReader: StateReader,
                          utxStorage: UtxPool,
-                         blockchainReadiness:
-                         AtomicBoolean,
+                         blockchainReadiness: AtomicBoolean,
                          miner: Miner,
                          settings: WavesSettings,
                          peerDatabase: PeerDatabase,
@@ -72,6 +75,24 @@ class CoordinatorHandler(checkpointService: CheckpointService,
     }
   }
 
+  private def processMicroBlockData(ctx: ChannelHandlerContext, invOpt: Option[MicroBlockInv], microBlock: MicroBlock): Unit = {
+    val microblockTotalResBlockSig = microBlock.totalResBlockSig
+    Future(Signed.validateSignatures(microBlock).flatMap(processMicroBlock)) onComplete {
+      case Success(Right(())) =>
+        invOpt match {
+          case Some(mi) => allChannels.broadcast(mi, Some(ctx.channel()))
+          case None => log.warn("Not broadcasting MicroBlockInv")
+        }
+        BlockStats.applied(microBlock)
+      case Success(Left(is: InvalidSignature)) =>
+        peerDatabase.blacklistAndClose(ctx.channel(), s"Could not append microblock $microblockTotalResBlockSig: $is")
+      case Success(Left(ve)) =>
+        BlockStats.declined(microBlock)
+        log.debug(s"Could not append microblock $microblockTotalResBlockSig: $ve")
+      case Failure(t) => rethrow(s"Error appending microblock $microblockTotalResBlockSig", t)
+    }
+  }
+
   private def rethrow(msg: String, failure: Throwable) = throw new Exception(msg, failure.getCause)
 
   override def channelRead(ctx: ChannelHandlerContext, msg: AnyRef): Unit = msg match {
@@ -92,7 +113,7 @@ class CoordinatorHandler(checkpointService: CheckpointService,
 
     case b: Block => Future({
       BlockStats.received(b, BlockStats.Source.Broadcast, ctx)
-      CoordinatorHandler.blockReceivingLag.safeRecord(System.currentTimeMillis() - b.timestamp)
+      blockReceivingLag.safeRecord(System.currentTimeMillis() - b.timestamp)
       Signed.validateSignatures(b).flatMap(b => processBlock(b, false))
     }) onComplete {
       case Success(Right(None)) =>
@@ -112,36 +133,128 @@ class CoordinatorHandler(checkpointService: CheckpointService,
       case Failure(t) => rethrow(s"Error appending block ${b.uniqueId}", t)
     }
 
-    case md: MicroblockData =>
-      val microBlock = md.microBlock
-      val microblockTotalResBlockSig = microBlock.totalResBlockSig
-      Future(Signed.validateSignatures(microBlock).flatMap(processMicroBlock)) onComplete {
-        case Success(Right(())) =>
-          md.invOpt match {
-            case Some(mi) => allChannels.broadcast(mi, Some(ctx.channel()))
-            case None => log.warn("Not broadcasting MicroBlockInv")
+    // From MicroBlockSynchronizer
+
+    case mbr@MicroBlockResponse(mb) =>
+      downloading.set(false)
+      Task {
+        log.trace(id(ctx) + "Received " + mbr)
+        knownMicroBlockOwners.invalidate(mb.totalResBlockSig)
+        successfullyReceivedMicroBlocks.put(mb.totalResBlockSig, dummy)
+
+        Option(microBlockReceiveTime.getIfPresent(mb.totalResBlockSig)) match {
+          case Some(created) =>
+            BlockStats.received(mb, ctx, propagationTime = System.currentTimeMillis() - created)
+            microBlockReceiveTime.invalidate(mb.totalResBlockSig)
+            processMicroBlockData(ctx, Option(awaitingMicroBlocks.getIfPresent(mb.totalResBlockSig)), mb)
+          case None =>
+            BlockStats.received(mb, ctx)
+        }
+      }.runAsync(scheduler)
+    case mi@MicroBlockInv(_, totalResBlockSig, prevResBlockSig, _) => Task.unit.flatMap { _ =>
+      Signed.validateSignatures(mi) match {
+        case Left(err) => Task.now(peerDatabase.blacklistAndClose(ctx.channel(), err.toString))
+        case Right(_) =>
+          log.trace(id(ctx) + "Received " + mi)
+          history.lastBlockId() match {
+            case Some(lastBlockId) =>
+              knownNextMicroBlocks.get(mi.prevBlockSig, { () =>
+                BlockStats.inv(mi, ctx)
+                mi
+              })
+              knownMicroBlockOwners.get(totalResBlockSig, () => MSet.empty) += ctx
+              microBlockReceiveTime.get(totalResBlockSig, () => System.currentTimeMillis())
+
+              if (lastBlockId == prevResBlockSig) {
+                microBlockInvStats.increment()
+
+                if (alreadyRequested(totalResBlockSig)) Task.unit
+                else tryDownloadNext(mi.prevBlockSig)
+              } else {
+                notLastMicroblockStats.increment()
+                log.trace(s"Discarding $mi because it doesn't match last (micro)block ${trim(lastBlockId)}")
+                Task.unit
+              }
+
+            case None =>
+              unknownMicroblockStats.increment()
+              Task.unit
           }
-          BlockStats.applied(microBlock)
-        case Success(Left(is: InvalidSignature)) =>
-          peerDatabase.blacklistAndClose(ctx.channel(), s"Could not append microblock $microblockTotalResBlockSig: $is")
-        case Success(Left(ve)) =>
-          BlockStats.declined(microBlock)
-          log.debug(s"Could not append microblock $microblockTotalResBlockSig: $ve")
-        case Failure(t) => rethrow(s"Error appending microblock $microblockTotalResBlockSig", t)
       }
+    }.runAsync(scheduler)
   }
-}
 
-object CoordinatorHandler extends ScorexLogging {
-  private val blockReceivingLag = Kamon.metrics.histogram("block-receiving-lag")
+  // From MicroBlockSynchronizer
 
-  def loggingResult[R](idCtx: String, msg: String, f: => Either[ValidationError, R]): Either[ValidationError, R] = {
-    log.debug(s"$idCtx Starting $msg processing")
-    val result = f
-    result match {
-      case Left(error) => log.warn(s"$idCtx Error processing $msg: $error")
-      case Right(newScore) => log.debug(s"$idCtx Finished $msg processing, new local score is $newScore")
+  import settings.synchronizationSettings.{microBlockSynchronizer => mbsSettings}
+
+  private val scheduler = monix.execution.Scheduler.singleThread("microblock-synchronizer", reporter = com.wavesplatform.utils.UncaughtExceptionsToLogReporter)
+
+  private val awaitingMicroBlocks = cache[MicroBlockSignature, MicroBlockInv](mbsSettings.invCacheTimeout)
+  private val knownMicroBlockOwners = cache[MicroBlockSignature, MSet[ChannelHandlerContext]](mbsSettings.invCacheTimeout)
+  private val knownNextMicroBlocks = cache[MicroBlockSignature, MicroBlockInv](mbsSettings.invCacheTimeout)
+  private val successfullyReceivedMicroBlocks = cache[MicroBlockSignature, Object](mbsSettings.processedMicroBlocksCacheTimeout)
+  private val microBlockReceiveTime = cache[MicroBlockSignature, java.lang.Long](mbsSettings.invCacheTimeout)
+  private val downloading = new AtomicBoolean(false)
+  blockchainUpdater.lastBlockId.foreach { lastBlockSig =>
+    tryDownloadNext(lastBlockSig).runAsync(scheduler)
+  }(scheduler)
+
+  private def alreadyRequested(microBlockSig: MicroBlockSignature): Boolean = Option(awaitingMicroBlocks.getIfPresent(microBlockSig)).isDefined
+
+  private def alreadyProcessed(microBlockSig: MicroBlockSignature): Boolean = Option(successfullyReceivedMicroBlocks.getIfPresent(microBlockSig)).isDefined
+
+  private def requestMicroBlockTask(microblockInv: MicroBlockInv, attemptsAllowed: Int): Task[Unit] = Task.unit.flatMap { _ =>
+    val totalResBlockSig = microblockInv.totalBlockSig
+    if (attemptsAllowed > 0 && !alreadyProcessed(totalResBlockSig)) {
+      val knownChannels = knownMicroBlockOwners.get(totalResBlockSig, () => MSet.empty)
+      random(knownChannels) match {
+        case Some(ctx) =>
+          knownChannels -= ctx
+          ctx.writeAndFlush(MicroBlockRequest(totalResBlockSig))
+          awaitingMicroBlocks.put(totalResBlockSig, microblockInv)
+          requestMicroBlockTask(microblockInv, attemptsAllowed - 1)
+            .delayExecution(mbsSettings.waitResponseTimeout)
+        case None => Task.unit
+      }
+    } else Task.unit
+  }
+
+  private def tryDownloadNext(prevBlockId: ByteStr): Task[Unit] = Task.unit.flatMap { _ =>
+    Option(knownNextMicroBlocks.getIfPresent(prevBlockId)) match {
+      case Some(mb) =>
+        if (downloading.compareAndSet(false, true)) requestMicroBlockTask(mb, MicroBlockDownloadAttempts)
+        else Task.unit
+      case None =>
+        Task.unit
     }
-    result
   }
+
+  // From MicroBlockSynchronizer companion
+
+  val blockReceivingLag = Kamon.metrics.histogram("block-receiving-lag")
+
+  // From MicroBlockSynchronizer
+
+  type MicroBlockSignature = ByteStr
+
+  val MicroBlockDownloadAttempts = 2
+
+  val microBlockInvStats = Kamon.metrics.registerCounter("micro-inv")
+
+  val notLastMicroblockStats = Kamon.metrics.registerCounter("micro-not-last")
+  val unknownMicroblockStats = Kamon.metrics.registerCounter("micro-unknown")
+
+  def random[T](s: MSet[T]): Option[T] = {
+    val n = util.Random.nextInt(s.size)
+    val ts = s.iterator.drop(n)
+    if (ts.hasNext) Some(ts.next)
+    else None
+  }
+
+  def cache[K <: AnyRef, V <: AnyRef](timeout: FiniteDuration): Cache[K, V] = CacheBuilder.newBuilder()
+    .expireAfterWrite(timeout.toMillis, TimeUnit.MILLISECONDS)
+    .build[K, V]()
+
+  val dummy = new Object()
 }

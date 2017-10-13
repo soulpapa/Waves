@@ -91,13 +91,6 @@ class NetworkServer(checkpointService: CheckpointService,
     new HandshakeHandler.Server(handshake, peerInfo, peerConnections, peerDatabase, allChannels)
 
   private val utxPoolSynchronizer = new UtxPoolSynchronizer(utxPool, allChannels)
-  private val microBlockSynchronizer = new MicroBlockSynchronizer(
-    settings.synchronizationSettings.microBlockSynchronizer,
-    history,
-    peerDatabase,
-    blockchainUpdater.lastBlockId
-  )
-
 
   private val serverChannel = settings.networkSettings.declaredAddress.map { _ =>
     new ServerBootstrap()
@@ -116,7 +109,7 @@ class NetworkServer(checkpointService: CheckpointService,
         messageCodec,
         peerSynchronizer,
         historyReplier,
-        microBlockSynchronizer,
+        //microBlockSynchronizer,
         new ExtensionSignaturesLoader(settings.synchronizationSettings.synchronizationTimeout, peerDatabase),
         new ExtensionBlocksLoader(settings.synchronizationSettings.synchronizationTimeout, peerDatabase, history),
         new OptimisticExtensionLoader,
@@ -151,7 +144,7 @@ class NetworkServer(checkpointService: CheckpointService,
       messageCodec,
       peerSynchronizer,
       historyReplier,
-      microBlockSynchronizer,
+      //microBlockSynchronizer,
       new ExtensionSignaturesLoader(settings.synchronizationSettings.synchronizationTimeout, peerDatabase),
       new ExtensionBlocksLoader(settings.synchronizationSettings.synchronizationTimeout, peerDatabase, history),
       new OptimisticExtensionLoader,
