@@ -101,13 +101,16 @@ class MinerImpl(
         val txAmount = if (ngEnabled) minerSettings.maxTransactionsInKeyBlock else ClassicAmountOfTxsInBlock
         val unconfirmed = utx.packUnconfirmed(txAmount, sortInBlock)
 
-        val features = if(version > 2) settings.featuresSettings.supported
-          .filter(featureProvider.featureStatus(_, parentHeight) == BlockchainFeatureStatus.Undefined)
-          .toSet.intersect(BlockchainFeatures.implemented) else Set.empty[Short]
-
         log.debug(s"Adding ${unconfirmed.size} unconfirmed transaction(s) to new block")
-        Block.buildAndSign(version.toByte, currentTime, referencedBlockInfo.blockId, consensusData, unconfirmed, account, features)
-          .left.map(l => l.err)
+
+        (if(version > 2){
+          Block.buildAndSignV3(currentTime, referencedBlockInfo.blockId, consensusData, unconfirmed, account,
+            settings.featuresSettings.supported
+              .filter(featureProvider.featureStatus(_, parentHeight) == BlockchainFeatureStatus.Undefined)
+              .toSet.intersect(BlockchainFeatures.implemented))
+        } else {
+          Block.buildAndSign(version.toByte, currentTime, referencedBlockInfo.blockId, consensusData, unconfirmed, account)
+        }).left.map(l => l.err)
       }
     } yield block)
   }.delayExecution(delay)
@@ -131,8 +134,7 @@ class MinerImpl(
       log.trace(s"Accumulated ${unconfirmed.size} txs for microblock")
       val start = System.currentTimeMillis()
       val block = for {
-        signedBlock <- Block.buildAndSign(
-          version = 3,
+        signedBlock <- Block.buildAndSignV3(
           timestamp = accumulatedBlock.timestamp,
           reference = accumulatedBlock.reference,
           consensusData = accumulatedBlock.consensusData,

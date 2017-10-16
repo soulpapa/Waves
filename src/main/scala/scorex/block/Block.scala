@@ -203,20 +203,33 @@ object Block extends ScorexLogging {
                    reference: ByteStr,
                    consensusData: NxtLikeConsensusBlockData,
                    transactionData: Seq[Transaction],
-                   signer: PrivateKeyAccount,
-                   featureVotes: Set[Short]): Either[GenericError, Block] = (for {
-    _ <- Either.cond(transactionData.size <= MaxTransactionsPerBlockVer3, (), s"Too many transactions in Block: allowed: $MaxTransactionsPerBlockVer3, actual: ${transactionData.size}")
+                   signer: PrivateKeyAccount): Either[GenericError, Block] = (for {
+    _ <- Either.cond(transactionData.size <= MaxTransactionsPerBlockVer1Ver2, (), s"Too many transactions in Block: allowed: $MaxTransactionsPerBlockVer1Ver2, actual: ${transactionData.size}")
     _ <- Either.cond(reference.arr.length == SignatureLength, (), "Incorrect reference")
     _ <- Either.cond(consensusData.generationSignature.arr.length == GeneratorSignatureLength, (), "Incorrect consensusData.generationSignature")
     _ <- Either.cond(signer.publicKey.length == KeyLength, (), "Incorrect signer.publicKey")
-    _ <- Either.cond(version > 2 || featureVotes.isEmpty, (), s"Block version $version could not contain feature votes")
-    _ <- Either.cond(featureVotes.size <= MaxFeaturesInBlock, (), s"Block could not contain more than $MaxFeaturesInBlock feature votes")
+    _ <- Either.cond(version <= 2, (), s"Use another method to create block version 3 and above")
   } yield {
-    val nonSignedBlock = Block(timestamp, version, reference, SignerData(signer, ByteStr.empty), consensusData, transactionData, featureVotes)
+    val nonSignedBlock = Block(timestamp, version, reference, SignerData(signer, ByteStr.empty), consensusData, transactionData, Set.empty)
     val toSign = nonSignedBlock.bytes
     val signature = EllipticCurveImpl.sign(signer, toSign)
     nonSignedBlock.copy(signerData = SignerData(signer, ByteStr(signature)))
   }).left.map(GenericError)
+
+  def buildAndSignV3(timestamp: Long,
+                     reference: ByteStr,
+                     consensusData: NxtLikeConsensusBlockData,
+                     transactionData: Seq[Transaction],
+                     signer: PrivateKeyAccount,
+                     featureVotes: Set[Short]): Either[GenericError, Block] = {
+    (for {
+      _ <- Either.cond(transactionData.size <= MaxTransactionsPerBlockVer3, (), s"Too many transactions in Block: allowed: $MaxTransactionsPerBlockVer3, actual: ${transactionData.size}")
+      _ <- Either.cond(featureVotes.size <= MaxFeaturesInBlock, (), s"Block could not contain more than $MaxFeaturesInBlock feature votes")
+    } yield {
+      val block = Block(timestamp, 3, reference, SignerData(signer, ByteStr.empty), consensusData, transactionData, featureVotes)
+      block.copy(signerData = SignerData(signer, ByteStr(EllipticCurveImpl.sign(signer, block.bytes))))
+    }).left.map(GenericError)
+  }
 
   def genesisTransactions(gs: GenesisSettings): Seq[GenesisTransaction] = {
     gs.transactions.map { ts =>

@@ -48,17 +48,26 @@ package object history {
 
   def customBuildBlockOfTxs(refTo: ByteStr, txs: Seq[Transaction],
                             signer: PrivateKeyAccount, version: Byte, timestamp: Long, bTarget: Long = DefaultBaseTarget): Block =
-    Block.buildAndSign(
-      version = version,
-      timestamp = timestamp,
-      reference = refTo,
-      consensusData = NxtLikeConsensusBlockData(
-        baseTarget = bTarget,
-        generationSignature = generationSignature),
-      transactionData = txs,
-      signer = signer,
-      Set.empty).explicitGet()
-
+    (if(version <= 2)
+      Block.buildAndSign(
+        version = version,
+        timestamp = timestamp,
+        reference = refTo,
+        consensusData = NxtLikeConsensusBlockData(
+          baseTarget = bTarget,
+          generationSignature = generationSignature),
+        transactionData = txs,
+        signer = signer)
+    else
+      Block.buildAndSignV3(
+        timestamp = timestamp,
+        reference = refTo,
+        consensusData = NxtLikeConsensusBlockData(
+          baseTarget = bTarget,
+          generationSignature = generationSignature),
+        transactionData = txs,
+        signer = signer,
+        featureVotes = Set.empty)).explicitGet()
 
   def customBuildMicroBlockOfTxs(totalRefTo: ByteStr, prevTotal: Block, txs: Seq[Transaction],
                                  signer: PrivateKeyAccount, version: Byte, ts: Long): (Block, MicroBlock) = {

@@ -51,9 +51,8 @@ object JsBlockParser extends App {
 //    Set.empty)
 
 
-  val goodBlock = Block.buildAndSign(
+  val goodBlock = Block.buildAndSignV3(
     timestamp = 0L,
-    version = 3.toByte,
     reference = ByteStr.decodeBase58("2RxD9WRHsLcLMSf58VPj38TaA7XyYrREaz3vsKWVFS7JE93wGzd57UTrHdzb1v2bdgS3fhZK96HAjsr2gb5gq43w").get,
     signer = TestBlock.defaultSigner,
     consensusData = NxtLikeConsensusBlockData(1,ByteStr.decodeBase58("D866WPMvdahU2BdLowfYY9m4GrqXfXSmFxFd4e6rKYTd").get),

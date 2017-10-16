@@ -20,10 +20,15 @@ object TestBlock {
   def randomSignature(): ByteStr = randomOfLength(SignatureLength)
 
   private def sign(signer: PrivateKeyAccount, b: Block): Block = {
-    Block.buildAndSign(version = b.version, timestamp = b.timestamp, reference = b.reference,
-      consensusData = b.consensusData, transactionData = b.transactionData,
-      signer = signer, featureVotes = b.featureVotes).explicitGet()
-
+    (if(b.version <= 2){
+      Block.buildAndSign(version = b.version, timestamp = b.timestamp, reference = b.reference,
+        consensusData = b.consensusData, transactionData = b.transactionData,
+        signer = signer)
+    } else if (b.version == 3) {
+      Block.buildAndSignV3(timestamp = b.timestamp, reference = b.reference,
+        consensusData = b.consensusData, transactionData = b.transactionData,
+        signer = signer, featureVotes = b.featureVotes)
+    } else ???).explicitGet()
   }
 
   def create(txs: Seq[Transaction]): Block = create(defaultSigner, txs)
