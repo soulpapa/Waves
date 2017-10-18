@@ -95,7 +95,7 @@ abstract class HandshakeHandler(
           ctx.fireChannelRead(msg)
         }
       }
-    case _ => super.channelRead(ctx, msg)
+    case _ =>
   }
 
   protected def connectionNegotiated(ctx: ChannelHandlerContext): Unit = {
